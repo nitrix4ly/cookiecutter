@@ -168,6 +168,10 @@ def generate_context(
     if extra_context:
         apply_overwrites_to_context(obj, extra_context)
 
+    # extra: early validation to avoid hidden issues
+    if "cookiecutter" not in context:
+        raise ContextDecodingException("Missing 'cookiecutter' key in context.")
+
     logger.debug('Context generated is %s', context)
     return context
 
@@ -178,6 +182,7 @@ def generate_file(
     context: dict[str, Any],
     env: Environment,
     skip_if_file_exists: bool = False,
+    dry_run: bool = False,  # extra: allow dry run to skip file writes
 ) -> None:
     """Render filename of infile as name of outfile, handle infile correctly.
 
@@ -201,9 +206,7 @@ def generate_file(
     """
     logger.debug('Processing file %s', infile)
 
-    # Render the path to the output file (not including the root project dir)
     outfile_tmpl = env.from_string(infile)
-
     outfile = os.path.join(project_dir, outfile_tmpl.render(**context))
     file_name_is_empty = os.path.isdir(outfile)
     if file_name_is_empty:
@@ -212,6 +215,10 @@ def generate_file(
 
     if skip_if_file_exists and os.path.exists(outfile):
         logger.debug('The resulting file already exists: %s', outfile)
+        return
+
+    if dry_run:
+        logger.info("[DRY RUN] Would create file: %s", outfile)
         return
 
     logger.debug('Created file at %s', outfile)
@@ -224,31 +231,25 @@ def generate_file(
         shutil.copymode(infile, outfile)
         return
 
-    # Force fwd slashes on Windows for get_template
-    # This is a by-design Jinja issue
     infile_fwd_slashes = infile.replace(os.path.sep, '/')
 
-    # Render the file
     try:
         tmpl = env.get_template(infile_fwd_slashes)
     except TemplateSyntaxError as exception:
-        # Disable translated so that printed exception contains verbose
-        # information about syntax error location
         exception.translated = False
         raise
     rendered_file = tmpl.render(**context)
 
     if context['cookiecutter'].get('_new_lines', False):
-        # Use `_new_lines` from context, if configured.
         newline = context['cookiecutter']['_new_lines']
         logger.debug('Using configured newline character %s', repr(newline))
     else:
-        # Detect original file newline to output the rendered file.
-        # Note that newlines can be a tuple if file contains mixed line endings.
-        # In this case, we pick the first line ending we detected.
         with open(infile, encoding='utf-8') as rd:
-            rd.readline()  # Read only the first line to load a 'newlines' value.
-        newline = rd.newlines[0] if isinstance(rd.newlines, tuple) else rd.newlines
+            rd.readline()
+        # extra: fallback to OS default if detection fails
+        newline = (
+            rd.newlines[0] if isinstance(rd.newlines, tuple) else rd.newlines
+        ) or os.linesep
         logger.debug('Using detected newline character %s', repr(newline))
 
     logger.debug('Writing contents to file %s', outfile)
@@ -256,7 +257,6 @@ def generate_file(
     with open(outfile, 'w', encoding='utf-8', newline=newline) as fh:
         fh.write(rendered_file)
 
-    # Apply file permissions to output file
     shutil.copymode(infile, outfile)
 
 
@@ -266,6 +266,7 @@ def render_and_create_dir(
     output_dir: Path | str,
     environment: Environment,
     overwrite_if_exists: bool = False,
+    dry_run: bool = False,  # extra: dry run option for dirs
 ) -> tuple[Path, bool]:
     """Render name of a directory, create the directory, return its path."""
     if not dirname or dirname == "":
@@ -292,7 +293,10 @@ def render_and_create_dir(
             msg = f'Error: "{dir_to_create}" directory already exists'
             raise OutputDirExistsException(msg)
     else:
-        make_sure_path_exists(dir_to_create)
+        if not dry_run:
+            make_sure_path_exists(dir_to_create)
+        else:
+            logger.info("[DRY RUN] Would create directory: %s", dir_to_create)
 
     return dir_to_create, not output_dir_exists
 
@@ -319,7 +323,7 @@ def _run_hook_from_repo_dir(
         DeprecationWarning,
         2,
     )
-    run_hook_from_repo_dir(
+    return run_hook_from_repo_dir(
         repo_dir, hook_name, project_dir, context, delete_project_on_failure
     )
 
@@ -332,6 +336,7 @@ def generate_files(
     skip_if_file_exists: bool = False,
     accept_hooks: bool = True,
     keep_project_on_failure: bool = False,
+    dry_run: bool = False,  # extra: top-level dry run option
 ) -> str:
     """Render the templates and saves them to files.
 
@@ -357,27 +362,18 @@ def generate_files(
     try:
         project_dir: Path | str
         project_dir, output_directory_created = render_and_create_dir(
-            unrendered_dir, context, output_dir, env, overwrite_if_exists
+            unrendered_dir, context, output_dir, env, overwrite_if_exists, dry_run
         )
     except UndefinedError as err:
         msg = f"Unable to create project directory '{unrendered_dir}'"
         raise UndefinedVariableInTemplate(msg, err, context) from err
 
-    # We want the Jinja path and the OS paths to match. Consequently, we'll:
-    #   + CD to the template folder
-    #   + Set Jinja's path to '.'
-    #
-    #  In order to build our files to the correct folder(s), we'll use an
-    # absolute path for the target folder (project_dir)
-
     project_dir = os.path.abspath(project_dir)
     logger.debug('Project directory is %s', project_dir)
 
-    # if we created the output directory, then it's ok to remove it
-    # if rendering fails
     delete_project_on_failure = output_directory_created and not keep_project_on_failure
 
-    if accept_hooks:
+    if accept_hooks and not dry_run:
         run_hook_from_repo_dir(
             repo_dir, 'pre_gen_project', project_dir, context, delete_project_on_failure
         )
@@ -386,17 +382,11 @@ def generate_files(
         env.loader = FileSystemLoader(['.', '../templates'])
 
         for root, dirs, files in os.walk('.'):
-            # We must separate the two types of dirs into different lists.
-            # The reason is that we don't want ``os.walk`` to go through the
-            # unrendered directories, since they will just be copied.
             copy_dirs = []
             render_dirs = []
 
             for d in dirs:
                 d_ = os.path.normpath(os.path.join(root, d))
-                # We check the full path, because that's how it can be
-                # specified in the ``_copy_without_render`` setting, but
-                # we store just the dir name
                 if is_copy_only_path(d_, context):
                     logger.debug('Found copy only path %s', d)
                     copy_dirs.append(d)
@@ -407,26 +397,23 @@ def generate_files(
                 indir = os.path.normpath(os.path.join(root, copy_dir))
                 outdir = os.path.normpath(os.path.join(project_dir, indir))
                 outdir = env.from_string(outdir).render(**context)
-                logger.debug('Copying dir %s to %s without rendering', indir, outdir)
+                if dry_run:
+                    logger.info("[DRY RUN] Would copy directory %s to %s", indir, outdir)
+                else:
+                    logger.debug('Copying dir %s to %s without rendering', indir, outdir)
+                    if os.path.isdir(outdir):
+                        shutil.rmtree(outdir)
+                    shutil.copytree(indir, outdir)
 
-                # The outdir is not the root dir, it is the dir which marked as copy
-                # only in the config file. If the program hits this line, which means
-                # the overwrite_if_exists = True, and root dir exists
-                if os.path.isdir(outdir):
-                    shutil.rmtree(outdir)
-                shutil.copytree(indir, outdir)
-
-            # We mutate ``dirs``, because we only want to go through these dirs
-            # recursively
             dirs[:] = render_dirs
             for d in dirs:
                 unrendered_dir = os.path.join(project_dir, root, d)
                 try:
                     render_and_create_dir(
-                        unrendered_dir, context, output_dir, env, overwrite_if_exists
+                        unrendered_dir, context, output_dir, env, overwrite_if_exists, dry_run
                     )
                 except UndefinedError as err:
-                    if delete_project_on_failure:
+                    if delete_project_on_failure and not dry_run:
                         rmtree(project_dir)
                     _dir = os.path.relpath(unrendered_dir, output_dir)
                     msg = f"Unable to create directory '{_dir}'"
@@ -438,23 +425,24 @@ def generate_files(
                     outfile_tmpl = env.from_string(infile)
                     outfile_rendered = outfile_tmpl.render(**context)
                     outfile = os.path.join(project_dir, outfile_rendered)
-                    logger.debug(
-                        'Copying file %s to %s without rendering', infile, outfile
-                    )
-                    shutil.copyfile(infile, outfile)
-                    shutil.copymode(infile, outfile)
+                    if dry_run:
+                        logger.info("[DRY RUN] Would copy file %s to %s", infile, outfile)
+                    else:
+                        logger.debug('Copying file %s to %s without rendering', infile, outfile)
+                        shutil.copyfile(infile, outfile)
+                        shutil.copymode(infile, outfile)
                     continue
                 try:
                     generate_file(
-                        project_dir, infile, context, env, skip_if_file_exists
+                        project_dir, infile, context, env, skip_if_file_exists, dry_run
                     )
                 except UndefinedError as err:
-                    if delete_project_on_failure:
+                    if delete_project_on_failure and not dry_run:
                         rmtree(project_dir)
                     msg = f"Unable to create file '{infile}'"
                     raise UndefinedVariableInTemplate(msg, err, context) from err
 
-    if accept_hooks:
+    if accept_hooks and not dry_run:
         run_hook_from_repo_dir(
             repo_dir,
             'post_gen_project',
